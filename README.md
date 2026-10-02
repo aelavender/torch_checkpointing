@@ -42,6 +42,7 @@ currently require CUDA; CPU-only users should use the explicit configuration in
 **Getting started**
 
 - [Tutorial](./docs/tutorials.md) — checkpoint and resume a complete training loop.
+- [FSDP2 example](./examples/FSDP2/) — sharded, asynchronous checkpoints of an FSDP2 model, resumable on a different number of GPUs.
 - [Overview](./docs/index.md) — what the library does and how the pieces fit together.
 - [Key concepts](./docs/key_concepts.md) — the `CheckpointManager`, the payload/`into=` model, and how async save and load work.
 - [Configuring checkpoints](./docs/configuring_checkpoints.md) — per-item `layout`, `requires_copy`, and `resharder` via `ItemSpec`.
