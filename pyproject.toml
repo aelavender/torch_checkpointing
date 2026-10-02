@@ -30,7 +30,9 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.6.0",
+    # Older torch lacks private APIs imported here (< 2.9), or its torch.save
+    # keeps the saved storages alive until the next GC cycle (2.9).
+    "torch>=2.10",
     "numpy",
     "safetensors>=0.4.3",
     "typing_extensions>=4.6.0",

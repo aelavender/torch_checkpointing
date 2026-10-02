@@ -23,7 +23,7 @@ resharders, cross-rank coordination — through the
 pip install torch_checkpointing
 ```
 
-Requires Python >= 3.10 and torch >= 2.6.
+Requires Python >= 3.10 and torch >= 2.10.
 
 Saving is asynchronous by default. The optimized async staging defaults
 currently require CUDA; CPU-only users should use the explicit configuration in
