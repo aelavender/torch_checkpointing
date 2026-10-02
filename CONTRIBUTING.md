@@ -9,15 +9,36 @@ clear and has sufficient instructions to be able to reproduce the issue.
 
 ## Development setup
 
-`torch_checkpointing` requires Python >= 3.10 and torch >= 2.10. Clone the repo,
-install it in editable mode with the dev extras, and run the tests:
+`torch_checkpointing` requires Python >= 3.10 and torch >= 2.10. We use
+[uv](https://docs.astral.sh/uv/) to manage the development environment:
 
 ```bash
 git clone https://github.com/meta-pytorch/torch_checkpointing
 cd torch_checkpointing
-pip install -e ".[dev]"   # pytest, coverage, and formatting/type-check tools
-pytest                     # runs the tests/ suite
+uv sync               # create .venv: the package (editable) plus test and lint tools
+uv run pytest         # run the tests/ suite
+uv run ruff check .   # lint
 ```
+
+`uv sync` installs torch from PyPI, which on Linux is a CUDA build, so the GPU
+tests run if your machine has GPUs. To use the CPU-only build instead, as CI
+does:
+
+```bash
+uv sync --no-group cuda --group cpu
+uv run --no-sync pytest   # plain `uv run` would switch back to the CUDA build
+```
+
+If your NVIDIA driver is too old for PyPI's CUDA build, let uv pick a build that
+matches it:
+
+```bash
+uv pip install --reinstall-package torch torch --torch-backend auto
+uv run --no-sync pytest
+```
+
+If you change dependencies in `pyproject.toml`, run `uv lock` and commit the
+updated `uv.lock`.
 
 ## Pull Requests
 

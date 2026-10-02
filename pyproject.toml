@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=42.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.11.15,<0.13.0"]
+build-backend = "uv_build"
 
 [project]
 name = "torch_checkpointing"
 version = "0.1.0"
 description = "A high-performance, distributed-training-ready checkpointing library for PyTorch models"
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 authors = [
     {name = "Meta Platforms, Inc."},
 ]
@@ -21,11 +22,12 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 requires-python = ">=3.10"
@@ -33,7 +35,7 @@ dependencies = [
     # Older torch lacks private APIs imported here (< 2.9), or its torch.save
     # keeps the saved storages alive until the next GC cycle (2.9).
     "torch>=2.10",
-    "numpy",
+    "numpy>=1.21.6",
     "safetensors>=0.4.3",
     "typing_extensions>=4.6.0",
 ]
@@ -43,28 +45,50 @@ Homepage = "https://github.com/meta-pytorch/torch_checkpointing"
 Repository = "https://github.com/meta-pytorch/torch_checkpointing"
 Issues = "https://github.com/meta-pytorch/torch_checkpointing/issues"
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "expecttest",
-    "black>=23.0.0",
-    "isort>=5.12.0",
-    "mypy>=1.5.0",
-]
+[dependency-groups]
 test = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "expecttest",
+    "pytest>=8.0",
+    # Both imported by torch.testing._internal.common_utils; torch only declares
+    # setuptools on every Python version from 2.14 onwards.
+    "expecttest>=0.2.1",
+    "setuptools>=77.0.3",
+]
+lint = ["ruff>=0.6"]
+dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
+]
+# Which torch build `uv sync` installs; pick one. `cuda` (the default) is the
+# PyPI build, which is CUDA-enabled on Linux. `cpu` is the CPU-only build, for
+# CI and machines without a GPU: `uv sync --no-group cuda --group cpu`.
+cuda = ["torch>=2.10"]
+cpu = ["torch>=2.10"]
+
+[tool.uv]
+required-version = ">=0.11.15"
+default-groups = ["dev", "cuda"]
+conflicts = [[{ group = "cpu" }, { group = "cuda" }]]
+# Only resolve versions with wheels for these platforms. Without this, the
+# lowest torch on the CPU index (`2.10.0`, not `2.10.0+cpu`) is macOS-only.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["torch_checkpointing*"]
-exclude = ["tests*"]
+[tool.uv.build-backend]
+module-root = ""
+source-include = ["tests/**"]
 
-[tool.setuptools.package-data]
-"torch_checkpointing" = ["py.typed"]
+# Scoped to the `cpu` group, so it never applies when another project installs
+# this one from git or a path. Published metadata depends on plain `torch`.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", group = "cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 
 # Pyright type checker configuration
@@ -90,6 +114,11 @@ reportIncompatibleMethodOverride = "warning"
 # pytest configuration
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "gpus_needed_1: requires 1 GPU",
+    "gpus_needed_2: requires 2 GPUs",
+    "gpus_needed_4: requires 4 GPUs",
+]
 
 [tool.ruff]
 target-version = "py310"
@@ -97,6 +126,10 @@ src = []
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__ files re-export symbols on purpose.
+"__init__.py" = ["F401"]
 
 [tool.ruff.lint.isort]
 case-sensitive = false
