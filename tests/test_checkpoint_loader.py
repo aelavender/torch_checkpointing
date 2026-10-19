@@ -10,6 +10,7 @@ Tests for CheckpointLoader class.
 
 import os
 import tempfile
+from unittest import mock
 
 import pytest
 import torch
@@ -19,7 +20,12 @@ from torch_checkpointing import (
     make_async_checkpoint_saver,
     make_sync_checkpoint_saver,
 )
-from torch_checkpointing.checkpoint_base import CheckpointBase
+from torch_checkpointing.checkpoint_base import (
+    CheckpointBase,
+    CheckpointInfo,
+    CheckpointItem,
+)
+from torch_checkpointing.default_resharder import DefaultResharder
 from torch_checkpointing.metadata_manager import DefaultMetadataManager
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import RankInfo
@@ -32,14 +38,22 @@ class SimpleCheckpoint(CheckpointBase):
         self._state_dict = state_dict
 
     def get_items(self):
-        from torch_checkpointing.checkpoint_base import CheckpointItem
-
         return {
             key: CheckpointItem(value=value) for key, value in self._state_dict.items()
         }
 
     def load_state_dict(self, state_dict):
         self._state_dict.update(state_dict)
+
+
+class ReshardableCheckpoint(SimpleCheckpoint):
+    """SimpleCheckpoint whose items all declare a DefaultResharder."""
+
+    def get_items(self):
+        return {
+            key: CheckpointItem(value=value, resharder=DefaultResharder())
+            for key, value in self._state_dict.items()
+        }
 
 
 @pytest.fixture
@@ -138,37 +152,59 @@ def test_load_basic(rank_info, sample_state_dict):
         checkpointer.close()
 
 
-def test_load_with_metadata_manager(rank_info, sample_state_dict):
-    """Test load() with metadata manager triggers metadata computation and serialization."""
+def test_every_load_extracts_local_target_metadata_without_aggregating(
+    rank_info, sample_state_dict
+):
+    """Each load passes freshly extracted local metadata to the reader and never
+    runs the (collective) global aggregation or touches the save-side cache."""
     with tempfile.TemporaryDirectory() as tmpdir:
         checkpoint_path = os.path.join(tmpdir, "checkpoint")
-
-        # Save
-        save_checkpoint = SimpleCheckpoint(sample_state_dict)
         checkpointer = make_sync_checkpoint_saver(rank_info=rank_info)
-        checkpointer.save(checkpoint_path, save_checkpoint)
+        checkpointer.save(checkpoint_path, ReshardableCheckpoint(sample_state_dict))
+        checkpointer.close()
 
-        # Load with metadata manager
         metadata_manager = DefaultMetadataManager(rank_info=rank_info)
         loader = _make_loader(rank_info, metadata_manager=metadata_manager)
-        load_checkpoint = SimpleCheckpoint(
-            {
-                "model": {"weight": torch.zeros(10, 10), "bias": torch.zeros(10)},
-                "optimizer": {"step": torch.tensor(0)},
-            }
-        )
-        loader.load(checkpoint_path, load_checkpoint)
+        targets = []
+        with (
+            mock.patch.object(
+                metadata_manager,
+                "compute_metadata",
+                side_effect=AssertionError("load must not aggregate metadata"),
+            ),
+            mock.patch.object(
+                loader._reader, "read", wraps=loader._reader.read
+            ) as read,
+        ):
+            for _ in range(2):
+                target = ReshardableCheckpoint(
+                    {
+                        "model": {
+                            "weight": torch.zeros(10, 10),
+                            "bias": torch.zeros(10),
+                        },
+                        "optimizer": {"step": torch.tensor(0)},
+                    }
+                )
+                loader.load(checkpoint_path, target)
+                targets.append(target)
 
-        # Metadata should be serialized in the metadata_manager
-        # (computed asynchronously for later use by a saver with the same metadata_manager)
-        serialized_bytes = metadata_manager.get_serialized_metadata()
-        assert serialized_bytes is not None
-        assert isinstance(serialized_bytes, bytes)
-        assert len(serialized_bytes) > 0
+        assert read.call_count == 2
+        for call, target in zip(read.call_args_list, targets):
+            target_local_metadata = call.kwargs["checkpoint_info"].target_local_metadata
+            expected = metadata_manager.extract_object_metadata(
+                CheckpointInfo(checkpoint_items=target.get_items())
+            )
+            assert set(expected) == {"model", "optimizer"}
+            assert target_local_metadata == expected
+            assert torch.equal(
+                target._state_dict["model"]["weight"],
+                sample_state_dict["model"]["weight"],
+            )
+        assert metadata_manager.get_serialized_metadata() is None
 
         loader.close()
         metadata_manager.close()
-        checkpointer.close()
 
 
 @pytest.mark.gpus_needed_1
@@ -177,7 +213,7 @@ def test_load_with_metadata_manager(rank_info, sample_state_dict):
     reason="requires an accelerator (async saver staging)",
 )
 def test_shared_metadata_manager_load_then_save(rank_info, sample_state_dict):
-    """Test that shared metadata_manager enables metadata reuse between load and save."""
+    """Test that a metadata_manager can be shared between a loader and a saver."""
     with tempfile.TemporaryDirectory() as tmpdir:
         checkpoint_path1 = os.path.join(tmpdir, "checkpoint1")
         checkpoint_path2 = os.path.join(tmpdir, "checkpoint2")
@@ -191,8 +227,6 @@ def test_shared_metadata_manager_load_then_save(rank_info, sample_state_dict):
         # Create shared metadata_manager for loader and saver
         metadata_manager = DefaultMetadataManager(rank_info=rank_info)
 
-        # Load using CheckpointLoader
-        # Metadata is computed and serialized in the shared metadata_manager
         loader = _make_loader(rank_info, metadata_manager=metadata_manager)
         load_checkpoint = SimpleCheckpoint(
             {
@@ -203,14 +237,10 @@ def test_shared_metadata_manager_load_then_save(rank_info, sample_state_dict):
         loader.load(checkpoint_path1, load_checkpoint)
         loader.close()
 
-        # Create checkpointer with the SAME metadata_manager
-        # It will reuse the metadata computed during load
         checkpointer2 = make_async_checkpoint_saver(
             rank_info=rank_info,
             checkpoint_metadata_manager=metadata_manager,
         )
-
-        # Save should work and reuse the metadata from the shared manager
         checkpointer2.save(checkpoint_path2, load_checkpoint)
         checkpointer2.close()
         metadata_manager.close()

@@ -131,6 +131,7 @@ class ShardingMetadata(ABC):
 # Type alias for metadata of all sharded objects within one checkpoint item
 # Maps nested path (within item) to the sharding metadata for that object
 ItemMetadata = dict[NestedPath, ShardingMetadata]
+LocalMetadata = dict[str, ItemMetadata]
 
 
 def _serialize_nested_path(path: NestedPath) -> str:
@@ -523,4 +524,4 @@ class CheckpointMetadata:
     """
 
     distributed_metadata: DistributedMetadata
-    local_metadata: dict[str, dict[NestedPath, ShardingMetadata]]
+    local_metadata: LocalMetadata

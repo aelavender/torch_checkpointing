@@ -32,7 +32,6 @@ from torch_checkpointing.checkpoint_reader import (
 )
 from torch_checkpointing.default_resharder import DefaultResharder
 from torch_checkpointing.distributed_metadata import (
-    CheckpointMetadata,
     DistributedItemMetadata,
     DistributedMetadata,
     GlobalObjectMetadata,
@@ -585,22 +584,6 @@ class TestCheckpointReader(TestCase):
             },
             world_size=2,
         )
-        target_distributed_metadata = DistributedMetadata(
-            metadata={
-                "model": DistributedItemMetadata(
-                    nested_path_to_metadata={
-                        ("weight",): [
-                            GlobalObjectMetadata(
-                                sharding_metadata=target_sharding,
-                                ranks=(0,),
-                            )
-                        ]
-                    },
-                    rank_to_layout_info={0: configured_layout},
-                )
-            },
-            world_size=1,
-        )
         with open(os.path.join(checkpoint_path, METADATA_FILE_NAME), "wb") as stream:
             pickle.dump(source_distributed_metadata.to_dict(), stream)
 
@@ -613,12 +596,7 @@ class TestCheckpointReader(TestCase):
                     resharder=resharder,
                 )
             }
-        ).for_reads(
-            CheckpointMetadata(
-                distributed_metadata=target_distributed_metadata,
-                local_metadata={"model": {("weight",): target_sharding}},
-            )
-        )
+        ).for_reads({"model": {("weight",): target_sharding}})
 
         loaded, missing = self.reader.read(checkpoint_path, checkpoint_info)
 
@@ -650,22 +628,6 @@ class TestCheckpointReader(TestCase):
             },
             world_size=1,
         )
-        target_distributed_metadata = DistributedMetadata(
-            metadata={
-                "model": DistributedItemMetadata(
-                    nested_path_to_metadata={
-                        ("weight",): [
-                            GlobalObjectMetadata(
-                                sharding_metadata=target_sharding,
-                                ranks=(0,),
-                            )
-                        ]
-                    },
-                    rank_to_layout_info={0: None},
-                )
-            },
-            world_size=1,
-        )
         with open(os.path.join(checkpoint_path, METADATA_FILE_NAME), "wb") as stream:
             pickle.dump(source_distributed_metadata.to_dict(), stream)
 
@@ -678,12 +640,7 @@ class TestCheckpointReader(TestCase):
                     resharder=resharder,
                 )
             }
-        ).for_reads(
-            CheckpointMetadata(
-                distributed_metadata=target_distributed_metadata,
-                local_metadata={"model": {("weight",): target_sharding}},
-            )
-        )
+        ).for_reads({"model": {("weight",): target_sharding}})
 
         loaded, missing = self.reader.read(checkpoint_path, checkpoint_info)
 
@@ -748,22 +705,6 @@ class TestCheckpointReader(TestCase):
             },
             world_size=1,
         )
-        target_distributed_metadata = DistributedMetadata(
-            metadata={
-                "model": DistributedItemMetadata(
-                    nested_path_to_metadata={
-                        ("weight",): [
-                            GlobalObjectMetadata(
-                                sharding_metadata=target_sharding,
-                                ranks=(0,),
-                            )
-                        ]
-                    },
-                    rank_to_layout_info={0: None},
-                )
-            },
-            world_size=1,
-        )
         with open(os.path.join(checkpoint_path, METADATA_FILE_NAME), "wb") as stream:
             pickle.dump(source_distributed_metadata.to_dict(), stream)
 
@@ -777,12 +718,7 @@ class TestCheckpointReader(TestCase):
                     resharder=resharder,
                 ),
             }
-        ).for_reads(
-            CheckpointMetadata(
-                distributed_metadata=target_distributed_metadata,
-                local_metadata={"model": {("weight",): target_sharding}},
-            )
-        )
+        ).for_reads({"model": {("weight",): target_sharding}})
 
         with pytest.raises(
             (FileNotFoundError, RuntimeError),

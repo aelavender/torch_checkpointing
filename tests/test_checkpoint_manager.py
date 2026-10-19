@@ -19,6 +19,11 @@ from torch_checkpointing.config import (
     CheckpointLoaderConfig,
     SyncCheckpointSaverConfig,
 )
+from torch_checkpointing.default_resharder import DefaultResharder
+from torch_checkpointing.metadata_serialization import (
+    load_distributed_metadata,
+    TorchDistributedMetadataFormat,
+)
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.staging import CheckpointStagerConfig
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
@@ -285,6 +290,70 @@ def test_async_save_then_load_round_trip(tmp_path: Path) -> None:
         assert loaded["step"] == 10
     finally:
         manager.close()
+
+
+@pytest.mark.parametrize("async_save", [False, True], ids=["sync", "async"])
+def test_load_subset_then_save_all_items_writes_metadata_for_all(
+    tmp_path: Path, async_save: bool
+) -> None:
+    # Fine-tuning from a weights-only checkpoint: load the model, then save the
+    # model with a fresh optimizer through the same manager.
+    def build() -> CheckpointManager:
+        config = (
+            _async_config_without_accelerator()
+            if async_save
+            else CheckpointManager.Config.with_sync_save()
+        )
+        config.items = {
+            "model": ItemSpec(resharder=DefaultResharder()),
+            "optim": ItemSpec(resharder=DefaultResharder(), required=False),
+        }
+        config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
+        return config.build()
+
+    def save(manager: CheckpointManager, path: str, payload: dict[str, Any]) -> None:
+        write_future = manager.save(path, payload)
+        if write_future is not None:
+            write_future.result(timeout=30)
+
+    weights_path = os.path.join(tmp_path, "weights")
+    full_path = os.path.join(tmp_path, "full")
+    weights = {"w": torch.arange(4, dtype=torch.float32)}
+    optim = {"exp_avg": torch.ones(4)}
+
+    manager = build()
+    try:
+        save(manager, weights_path, {"model": weights})
+    finally:
+        manager.close()
+
+    manager = build()
+    try:
+        model = {"w": torch.zeros(4)}
+        manager.load(weights_path, into={"model": model}, strict=True)
+        save(manager, full_path, {"model": model, "optim": optim})
+    finally:
+        manager.close()
+
+    metadata = load_distributed_metadata(
+        full_path,
+        LocalFileSystemStorageConfig(use_direct_io=False).create_storage(),
+        formats=(TorchDistributedMetadataFormat,),
+    )
+    assert metadata is not None
+    assert set(metadata.metadata) == {"model", "optim"}
+
+    manager = build()
+    try:
+        loaded = manager.load(
+            full_path,
+            into={"model": {"w": torch.zeros(4)}, "optim": {"exp_avg": torch.zeros(4)}},
+            strict=True,
+        )
+    finally:
+        manager.close()
+    torch.testing.assert_close(loaded["model"]["w"], weights["w"])
+    torch.testing.assert_close(loaded["optim"]["exp_avg"], optim["exp_avg"])
 
 
 def test_save_strict_schema_rejects_unknown_key(tmp_path: Path) -> None:

@@ -130,9 +130,8 @@ class CheckpointManager:
 
         # Auto-wire a metadata manager when any item declares a resharder, so a
         # resharding load cannot silently fall back to the layout-unchanged fast
-        # path. One instance is shared between the saver and the loader: metadata
-        # computed and serialized on a load is cached and reused by a later save
-        # (same layout), rather than being recomputed.
+        # path. Loads only extract local target metadata; the saver alone
+        # aggregates (and caches) the global metadata it writes.
         if self._schema.has_resharder():
             self._metadata_manager: MetadataManager | None = DefaultMetadataManager(
                 rank_info=rank_info

@@ -370,10 +370,14 @@ class MetadataManager(ABC):
 - `extract_object_metadata` walks the checkpoint items and, for each item that
   has a resharder attached, calls that resharder's `extract_sharding_metadata`
   to get per-path `ShardingMetadata`. Items without a resharder are skipped
-  entirely.
-- `compute_metadata` orchestrates the full pipeline: local extraction, cross-rank
-  aggregation, and construction of the global view. It returns `None` when the
-  result is unchanged from a cached previous computation (see caching below).
+  entirely. It is purely local — no collectives, no caching — and it is all a
+  load needs: the loader calls it on every load to get this rank's *target*
+  metadata.
+- `compute_metadata` orchestrates the full save-side pipeline: local
+  extraction, cross-rank aggregation, and construction of the global view that
+  is written as the checkpoint's metadata file. Only savers call it. It returns
+  `None` when the result is unchanged from a cached previous computation (see
+  caching below).
 - `close` releases resources (a background serialization thread pool).
 
 ### `DefaultMetadataManager`
@@ -399,8 +403,7 @@ def __init__(
   state dict's structure and sharding are stable across checkpoints.
 - `enable_serialization=True` kicks off async serialization of the aggregated
   metadata (in a single-worker `ThreadPoolExecutor`) after the first compute, so
-  the bytes are ready to write without blocking the saver. Set it to `False` for
-  load-only scenarios where no save will ever happen.
+  the bytes are ready to write without blocking the async saver.
 
 What it computes:
 
@@ -436,11 +439,13 @@ item_key)` is what the resharder uses to find a source rank's shard file.
 
 ### Sharing a manager between saver and loader
 
-The metadata computed on load can be reused by a subsequent save. Construct a
-single `MetadataManager`, hand it to the `CheckpointLoader`, then hand the same
-instance to `make_async_checkpoint_saver` via `checkpoint_metadata_manager`. The
-loader triggers the compute (and its async serialization), and the saver reuses
-the already-serialized bytes rather than recomputing:
+One `MetadataManager` instance can serve both a `CheckpointLoader` and a saver.
+Loading never touches the manager's cache: every load extracts fresh local
+target metadata from the objects it is given, and issues no collectives. The
+first save computes the global view (the only step with collectives), caches it
+and serializes it; later saves reuse those bytes. So a load can be followed by a
+save of a different set of items, and a second load onto a different layout
+reshards correctly:
 
 ```python
 from torch_checkpointing.builder import make_async_checkpoint_saver
@@ -456,7 +461,7 @@ loader.load(path, checkpoint)
 loader.close()
 
 saver = make_async_checkpoint_saver(checkpoint_metadata_manager=metadata_manager)
-saver.save(new_path, checkpoint)  # reuses serialized metadata from the load
+saver.save(new_path, checkpoint)  # computes, caches and serializes metadata
 ```
 
 ---
@@ -523,26 +528,21 @@ class CheckpointLoader:
         self._metadata_manager = metadata_manager
 ```
 
-If `metadata_manager is None`, `_compute_metadata_once` returns `None`, so the
-`CheckpointReadInfo` carries no target metadata. Even if items happen to have
-resharders, `Resharder.should_reshard` then sees `target_metadata=None` and
-returns `False`, so every item falls back to the direct-read path. Only when a
-manager is present does the loader compute the *target* sharding metadata, pass
-it through to the reader, and let the resharders run. (Independently, if *no*
-item has a resharder — or every resharder sets `skip_resharding=True` — the
-reader short-circuits to direct reads without even loading the source metadata
-file.) For a load-only setup, construct the manager with
-`enable_serialization=False` to skip the serialization overhead you would only
-need for a save.
+If `metadata_manager is None`, the `CheckpointReadInfo` carries no target
+metadata. Even if items happen to have resharders, `Resharder.should_reshard`
+then sees `target_metadata=None` and returns `False`, so every item falls back
+to the direct-read path. Only when a manager is present does the loader extract
+the *target* sharding metadata (via `extract_object_metadata`, on every load,
+with no collectives), pass it through to the reader, and let the resharders run.
+(Independently, if *no* item has a resharder — or every resharder sets
+`skip_resharding=True` — the reader short-circuits to direct reads without even
+loading the source metadata file.)
 
 ```python
 from torch_checkpointing.checkpoint_loader import CheckpointLoader
 from torch_checkpointing.metadata_manager import DefaultMetadataManager
 
-metadata_manager = DefaultMetadataManager(
-    rank_info=rank_info,
-    enable_serialization=False,  # load-only
-)
+metadata_manager = DefaultMetadataManager(rank_info=rank_info)
 loader = CheckpointLoader(reader=reader, metadata_manager=metadata_manager)
 loader.load(path, checkpoint)  # resharding runs for items with a resharder
 loader.close()

@@ -33,11 +33,7 @@ from .checkpoint_layout import (
     SafetensorsSerialization,
     TorchSerialization,
 )
-from .distributed_metadata import (
-    CheckpointMetadata,
-    DistributedItemMetadata,
-    ShardingMetadata,
-)
+from .distributed_metadata import DistributedItemMetadata, LocalMetadata
 from .logging_utils import EventLogger, EventType
 from .metadata_serialization import (
     DistributedMetadataFormat,
@@ -47,7 +43,7 @@ from .metadata_serialization import (
 )
 from .storage.base_storage import Storage, StorageConfig
 from .storage.torch_serialization import MmapFill
-from .types import CheckpointPath, NestedPath, RankInfo, STATE_DICT
+from .types import CheckpointPath, RankInfo, STATE_DICT
 from .utils import from_dict
 from .walk_utils import walk_checkpoint_structure
 
@@ -144,9 +140,9 @@ class CheckpointReader:
         Args:
             path: The checkpoint directory to read.
             checkpoint_info (CheckpointReadInfo): Encapsulates state_dict, layout_info_mappings,
-                and optional checkpoint_metadata for resharding.
+                and optional target_local_metadata for resharding.
                 Each item in checkpoint_info.checkpoint_items may have a resharder for resharding.
-                checkpoint_metadata is used for resharding.
+                target_local_metadata is this rank's sharding metadata for those items.
             map_location (Any): Device mapping function or device name for relocating tensors.
             metadata_format: The only metadata format to load, which must be
                 present whenever the read needs metadata. A format that is not
@@ -204,26 +200,22 @@ class CheckpointReader:
 
         # Normal path with resharding support
         source_metadata = self._load_source_metadata(checkpoint_dir, metadata_format)
-        checkpoint_metadata = checkpoint_info.checkpoint_metadata
+        target_local_metadata = checkpoint_info.target_local_metadata or {}
         # Split items into two lists based on whether they need resharding
         items_needing_reshard: dict[str, CheckpointItem] = {}
         items_not_needing_reshard: dict[str, CheckpointItem] = {}
         for key, item in checkpoint_info.checkpoint_items.items():
-            # Get item-level metadata for should_reshard check
             source_item_metadata = source_metadata.get(key)
-
-            # Extract target metadata for this item from local_metadata
-            target_metadata: dict[NestedPath, ShardingMetadata] | None = None
-            if checkpoint_metadata and checkpoint_metadata.local_metadata:
-                # Get metadata directly by item_key
-                target_metadata = checkpoint_metadata.local_metadata.get(key)
+            target_item_metadata = target_local_metadata.get(key)
 
             # A skipping resharder has promised its layout is unchanged, so it is
             # read directly even when another item forces this path.
             if (
                 item.resharder is not None
                 and not item.resharder.skip_resharding
-                and item.resharder.should_reshard(source_item_metadata, target_metadata)
+                and item.resharder.should_reshard(
+                    source_item_metadata, target_item_metadata
+                )
             ):
                 assert source_item_metadata is not None, (
                     f"Missing source metadata for checkpoint item {key!r}"
@@ -268,14 +260,13 @@ class CheckpointReader:
 
         # Load items that need resharding
         if items_needing_reshard:
-            assert checkpoint_metadata is not None
             checkpoint_info_reshard = CheckpointInfo(
                 checkpoint_items=items_needing_reshard
             )
             reshard_result, reshard_missing = self._read_with_resharding(
                 str(checkpoint_dir),
                 checkpoint_info_reshard,
-                checkpoint_metadata,
+                target_local_metadata,
                 source_metadata,
                 map_location=map_location,
             )
@@ -452,7 +443,7 @@ class CheckpointReader:
         self,
         path: str,
         checkpoint_info: CheckpointInfo,
-        checkpoint_metadata: CheckpointMetadata,
+        target_local_metadata: LocalMetadata,
         source_metadata: Mapping[str, DistributedItemMetadata],
         *,
         map_location: Any = None,
@@ -471,8 +462,8 @@ class CheckpointReader:
             path: Path to the checkpoint directory.
             checkpoint_info: Encapsulates state_dict and layout_info_mappings.
                 All items must have non-None resharders.
-            checkpoint_metadata: Metadata for the target checkpoint, containing
-                local metadata for generating load plans.
+            target_local_metadata: This rank's sharding metadata per item, used
+                to generate load plans.
             source_metadata: Source distributed metadata and file layouts.
             map_location: Device mapping for tensor relocation.
 
@@ -496,15 +487,10 @@ class CheckpointReader:
             resharder = item.resharder
             assert resharder is not None  # API contract guarantees this
 
-            # Get target metadata for this item (direct access by item_key)
-            target_metadata: dict[NestedPath, ShardingMetadata] | None = (
-                checkpoint_metadata.local_metadata.get(key)
-            )
-
-            # Get item-level source metadata (direct access by item_key)
+            target_item_metadata = target_local_metadata.get(key)
             source_item_metadata = source_metadata.get(key)
 
-            if not target_metadata or source_item_metadata is None:
+            if not target_item_metadata or source_item_metadata is None:
                 logger.warning(f"Missing metadata for item {key}, skipping resharding")
                 continue
 
@@ -512,7 +498,7 @@ class CheckpointReader:
             unhandled_nested_paths = resharder.load(
                 source_path=Path(path),
                 item_key=key,
-                target_metadata=target_metadata,
+                target_metadata=target_item_metadata,
                 source_metadata=source_item_metadata,
                 target=result_dict[key],
                 storage=self._storage,

@@ -313,6 +313,54 @@ def test_manager_loads_indexed_hf_safetensors_and_ignores_extra_keys(
     torch.testing.assert_close(target["second"], second)
 
 
+@pytest.mark.parametrize("prior_op", ["load", "save"])
+def test_manager_reshards_indexed_hf_after_a_prior_load_or_save(
+    tmp_path: Path, prior_op: str
+) -> None:
+    first = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    second = torch.arange(4, dtype=torch.float32)
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    save_file({"first": first}, export_dir / "model-00001-of-00002.safetensors")
+    save_file({"second": second}, export_dir / "model-00002-of-00002.safetensors")
+    (export_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {
+                    "first": "model-00001-of-00002.safetensors",
+                    "second": "model-00002-of-00002.safetensors",
+                },
+            }
+        )
+    )
+
+    def new_target() -> dict[str, torch.Tensor]:
+        return {"first": torch.zeros_like(first), "second": torch.zeros_like(second)}
+
+    def load(target: dict[str, torch.Tensor]) -> None:
+        manager.load(
+            export_dir,
+            into={"model": target},
+            strict=True,
+            metadata_format=HuggingFaceSafetensorsDistributedMetadataFormat,
+        )
+
+    manager = _manager()
+    try:
+        if prior_op == "load":
+            load(new_target())
+        else:
+            manager.save(str(tmp_path / "native"), {"model": new_target()})
+        target = new_target()
+        load(target)
+    finally:
+        manager.close()
+
+    torch.testing.assert_close(target["first"], first)
+    torch.testing.assert_close(target["second"], second)
+
+
 def test_manager_loads_indexed_hf_safetensors_with_dotted_keys(
     tmp_path: Path,
 ) -> None:

@@ -27,6 +27,7 @@ from .distributed_metadata import (
     DistributedItemMetadata,
     DistributedMetadata,
     GlobalObjectMetadata,
+    LocalMetadata,
     ShardingMetadata,
 )
 from .logging_utils import EventLogger, EventType
@@ -70,12 +71,15 @@ class MetadataManager(ABC):
     def extract_object_metadata(
         self,
         checkpoint_info: CheckpointInfo,
-    ) -> dict[str, dict[NestedPath, ShardingMetadata]]:
+    ) -> LocalMetadata:
         """
         Extract per-path sharding metadata from checkpoint info, grouped by item_key.
 
         This method extracts metadata for all CheckpointItems with resharders,
         delegating to each resharder's extract_sharding_metadata method.
+
+        Loads call this directly to get their target metadata, so it must stay
+        purely local: no collectives, and no reads or writes of any cache.
 
         Args:
             checkpoint_info: CheckpointInfo containing checkpoint items
@@ -113,8 +117,7 @@ class DefaultMetadataManager(MetadataManager):
                 Note: Caching metadata assumes that the state_dict does not change between
                 intermediate checkpoints. If the state_dict is modified, cached metadata may become invalid
             enable_serialization: Whether to kick off async serialization of metadata after
-                first compute. Set to False for load-only scenarios where no save will happen,
-                avoiding unnecessary serialization overhead.
+                first compute. Only async savers consume the serialized bytes.
         """
         self._rank_info = rank_info
         self._process_group = process_group
@@ -124,7 +127,7 @@ class DefaultMetadataManager(MetadataManager):
             dict[str, dict[NestedPath, ShardingMetadata]] | None
         ) = None
 
-        # Async metadata serialization state (shared between loader and saver)
+        # Async metadata serialization state
         self._metadata_executor = ThreadPoolExecutor(max_workers=1)
         self._serialization_future: Future[bytes] | None = None
         self._cached_serialized_metadata: bytes | None = None
@@ -234,7 +237,7 @@ class DefaultMetadataManager(MetadataManager):
     def extract_object_metadata(
         self,
         checkpoint_info: CheckpointInfo,
-    ) -> dict[str, dict[NestedPath, ShardingMetadata]]:
+    ) -> LocalMetadata:
         """
         Extract per-path sharding metadata from checkpoint info, grouped by item_key.
 
@@ -252,7 +255,7 @@ class DefaultMetadataManager(MetadataManager):
             Only extracts metadata for CheckpointItems that have a resharder
             configured. Items without resharders are skipped entirely.
         """
-        result: dict[str, dict[NestedPath, ShardingMetadata]] = {}
+        result: LocalMetadata = {}
 
         for item_key, checkpoint_item in checkpoint_info.checkpoint_items.items():
             if checkpoint_item.resharder is None:

@@ -242,7 +242,7 @@ class TestDefaultResharder(DTensorTestBase):
     ) -> CheckpointReadInfo:
         """Create CheckpointReadInfo for reading operations."""
         checkpoint_info = CheckpointInfo(checkpoint_items=items)
-        return checkpoint_info.for_reads(checkpoint_metadata)
+        return checkpoint_info.for_reads(checkpoint_metadata.local_metadata)
 
     def _create_arange_tensor(
         self,

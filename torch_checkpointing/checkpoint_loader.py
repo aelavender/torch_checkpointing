@@ -19,7 +19,6 @@ from typing import Any, TypeVar
 
 from .checkpoint_base import CheckpointBase, CheckpointInfo, CheckpointReadInfo
 from .checkpoint_reader import CheckpointReader
-from .distributed_metadata import CheckpointMetadata
 from .logging_utils import EventLogger, EventType
 from .metadata_manager import MetadataManager
 from .metadata_serialization import DistributedMetadataFormat
@@ -64,40 +63,23 @@ class CheckpointLoader:
         self._reader = reader
         self._metadata_manager = metadata_manager
 
-    def _compute_metadata_once(
-        self,
-        checkpoint: CheckpointBase,
-    ) -> CheckpointMetadata | None:
-        """
-        Compute CheckpointMetadata. Only computes once per metadata_manager.
-
-        Uses compute_metadata() result as the guard - it returns None when cache is valid.
-        The metadata_manager automatically kicks off async serialization after first compute.
-
-        Returns:
-            CheckpointMetadata if newly computed, None if already computed or no metadata_manager.
-        """
-        if self._metadata_manager is None:
-            return None
-
-        items = checkpoint.get_items()
-        checkpoint_info = CheckpointInfo(checkpoint_items=items)
-
-        # compute_metadata returns None if cache is valid (already computed)
-        # It also kicks off async serialization automatically after first compute
-        return self._metadata_manager.compute_metadata(checkpoint_info)
-
     def _prepare_checkpoint_read_info(
         self,
         checkpoint: CheckpointBase,
-        checkpoint_metadata: CheckpointMetadata | None,
     ) -> CheckpointReadInfo:
         """
         Prepare CheckpointReadInfo for CheckpointReader.read().
+
+        The target metadata is extracted from the live items on every load. It is
+        purely local: a load issues no collectives and neither reads nor fills
+        the metadata manager's save-side cache.
         """
-        items = checkpoint.get_items()
-        checkpoint_info = CheckpointInfo(checkpoint_items=items)
-        return checkpoint_info.for_reads(checkpoint_metadata)
+        checkpoint_info = CheckpointInfo(checkpoint_items=checkpoint.get_items())
+        if self._metadata_manager is None:
+            return checkpoint_info.for_reads()
+        return checkpoint_info.for_reads(
+            self._metadata_manager.extract_object_metadata(checkpoint_info)
+        )
 
     def load(
         self,
@@ -146,12 +128,7 @@ class CheckpointLoader:
         logger.info(
             "Preparing checkpoint read info",
         )
-        # Prepare CheckpointReadInfo with metadata for resharding
-        # This also kicks off async serialization in the metadata_manager
-        checkpoint_metadata = self._compute_metadata_once(checkpoint)
-        checkpoint_read_info = self._prepare_checkpoint_read_info(
-            checkpoint, checkpoint_metadata
-        )
+        checkpoint_read_info = self._prepare_checkpoint_read_info(checkpoint)
         logger.info(
             "Finished preparing checkpoint read info",
             extra=event_logger(

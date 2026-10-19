@@ -23,7 +23,7 @@ from typing import Any
 from typing_extensions import TypeAlias
 
 from .checkpoint_layout import LayoutInfo
-from .distributed_metadata import CheckpointMetadata
+from .distributed_metadata import LocalMetadata
 from .resharding import Resharder
 from .types import STATE_DICT
 
@@ -182,21 +182,24 @@ class CheckpointInfo:
         )
 
     def for_reads(
-        self, checkpoint_metadata: CheckpointMetadata | None = None
+        self,
+        target_local_metadata: LocalMetadata | None = None,
     ) -> "CheckpointReadInfo":
         """
         Create a CheckpointReadInfo from this CheckpointInfo for read operations.
 
         Args:
-            checkpoint_metadata: Optional checkpoint metadata needed for resharding
-                during read operations.
+            target_local_metadata: This rank's sharding metadata for the items
+                being loaded, keyed by item key (from
+                ``MetadataManager.extract_object_metadata``). Without it, every
+                item is read directly.
 
         Returns:
             CheckpointReadInfo ready for reading from storage.
         """
         return CheckpointReadInfo(
             checkpoint_items=self.checkpoint_items,
-            checkpoint_metadata=checkpoint_metadata,
+            target_local_metadata=target_local_metadata,
         )
 
 
@@ -217,8 +220,8 @@ class CheckpointReadInfo(CheckpointInfo):
     """
     Encapsulates checkpoint data for reading from storage.
 
-    Extends CheckpointInfo with checkpoint metadata needed for resharding
-    during the read operation.
+    Extends CheckpointInfo with this rank's target sharding metadata, needed
+    for resharding during the read operation.
     """
 
-    checkpoint_metadata: CheckpointMetadata | None = field(default=None)
+    target_local_metadata: LocalMetadata | None = field(default=None)
