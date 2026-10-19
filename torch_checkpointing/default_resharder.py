@@ -32,7 +32,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import (
@@ -353,7 +352,7 @@ def _read_source_tensor_slice(
     load_plan: LoadPlan,
 ) -> torch.Tensor:
     source = _unwrap_dtensor(source)
-    if not isinstance(source, FakeTensor):
+    if type(source) not in (torch.Tensor, torch.nn.Parameter) or not source.is_meta:
         raise NotImplementedError(f"Source {load_plan.src_fqn!r} is not a plain tensor")
     if source.layout is not torch.strided:
         raise NotImplementedError(
@@ -877,12 +876,11 @@ class DefaultResharder(Resharder):
             source_fqns = {load_plan.src_fqn for _, load_plan in rank_plans}
             if isinstance(serialization_format, TorchSerialization):
                 _validate_offset_read_archive(stream)
-                with FakeTensorMode():
-                    metadata = torch.load(
-                        stream,  # type: ignore[arg-type]
-                        map_location="cpu",
-                        weights_only=False,
-                    )
+                metadata = torch.load(
+                    stream,  # type: ignore[arg-type]
+                    map_location="meta",
+                    weights_only=False,
+                )
                 flattened = _flatten_state_dict(item_key, metadata)
                 source_tensors = {
                     source_fqn: _unwrap_dtensor(flattened[source_fqn])
@@ -895,7 +893,7 @@ class DefaultResharder(Resharder):
                         layout_info.file_path,
                         source_rank,
                     )
-                source_tensors = safetensors_header.as_fake_tensors(source_fqns)
+                source_tensors = safetensors_header.as_meta_tensors(source_fqns)
             else:
                 raise ValueError(
                     "Unsupported serialization format "

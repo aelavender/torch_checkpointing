@@ -12,12 +12,11 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch, PropertyMock
+from unittest.mock import patch
 
 import pytest
 import torch
 from safetensors.torch import save as serialize_safetensors, save_file
-from torch._subclasses.fake_tensor import FakeTensor
 from torch_checkpointing.checkpoint_layout import (
     LayoutInfo,
     SafetensorsSerialization,
@@ -519,16 +518,26 @@ def test_load_preserves_conjugate_negative_view_in_offset_slice() -> None:
     assert not storage.read_args[0].pre_read_full_file
 
 
+def test_load_parameter_source_uses_offset_read() -> None:
+    source = torch.nn.Parameter(torch.arange(8, dtype=torch.float32))
+
+    target, storage = _load_second_half(source)
+
+    torch.testing.assert_close(target, source.detach()[4:])
+    assert len(storage.read_args) == 1
+    assert storage.read_args[0] is not None
+    assert not storage.read_args[0].pre_read_full_file
+
+
 def test_quantized_offset_fallback_has_specific_message(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     source = torch.arange(8, dtype=torch.float32)
 
     with patch.object(
-        FakeTensor,
+        torch.Tensor,
         "is_quantized",
-        new_callable=PropertyMock,
-        return_value=True,
+        property(lambda self: self.is_meta),
     ):
         target, storage = _load_second_half(source)
 
@@ -544,10 +553,9 @@ def test_offset_strategy_propagates_unsupported_tensor() -> None:
 
     with (
         patch.object(
-            FakeTensor,
+            torch.Tensor,
             "is_quantized",
-            new_callable=PropertyMock,
-            return_value=True,
+            property(lambda self: self.is_meta),
         ),
         pytest.raises(NotImplementedError, match="quantized"),
     ):
@@ -1175,11 +1183,11 @@ def test_load_reshards_safetensors_shards_described_by_native_metadata(
     torch.testing.assert_close(target["weight"], whole)
 
 
-def test_safetensors_fake_tensors_name_the_file_for_a_missing_fqn() -> None:
+def test_safetensors_meta_tensors_name_the_file_for_a_missing_fqn() -> None:
     metadata = SafetensorsFileMetadata(file_path="model.safetensors", tensors={})
 
     with pytest.raises(
         KeyError,
         match="'missing' is not in the safetensors header of model.safetensors",
     ):
-        metadata.as_fake_tensors(["missing"])
+        metadata.as_meta_tensors(["missing"])

@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Collection
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.checkpoint._hf_utils import (
     _get_safetensors_file_metadata,
     DATA_OFFSETS_KEY,
@@ -41,26 +40,25 @@ class SafetensorsFileMetadata:
     file_path: str
     tensors: dict[str, SerializedTensorSlice]
 
-    def as_fake_tensors(self, fqns: Collection[str]) -> dict[str, torch.Tensor]:
-        """Represent selected entries as fake tensors carrying their file offsets."""
+    def as_meta_tensors(self, fqns: Collection[str]) -> dict[str, torch.Tensor]:
+        """Represent selected entries as meta tensors carrying their file offsets."""
         result: dict[str, torch.Tensor] = {}
-        with FakeTensorMode():
-            for fqn in fqns:
-                serialized = self.tensors.get(fqn)
-                if serialized is None:
-                    raise KeyError(
-                        f"{fqn!r} is not in the safetensors header of {self.file_path}"
-                    )
-                tensor = torch.empty_strided(
-                    serialized.slice_shape,
-                    serialized.serialized_strides,
-                    dtype=serialized.torch_dtype,
-                    device="cpu",
+        for fqn in fqns:
+            serialized = self.tensors.get(fqn)
+            if serialized is None:
+                raise KeyError(
+                    f"{fqn!r} is not in the safetensors header of {self.file_path}"
                 )
-                tensor.untyped_storage()._checkpoint_offset = (
-                    serialized.byte_address.start_byte_offset
-                )
-                result[fqn] = tensor
+            tensor = torch.empty_strided(
+                serialized.slice_shape,
+                serialized.serialized_strides,
+                dtype=serialized.torch_dtype,
+                device="meta",
+            )
+            tensor.untyped_storage()._checkpoint_offset = (
+                serialized.byte_address.start_byte_offset
+            )
+            result[fqn] = tensor
         return result
 
     @classmethod
