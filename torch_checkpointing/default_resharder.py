@@ -19,6 +19,7 @@ The core algorithm:
 5. Deduplicate across replicated source ranks and optimize source rank selection.
 """
 
+import functools
 import io
 import logging
 import os
@@ -52,6 +53,7 @@ from .distributed_metadata import (
     ShardingMetadata,
 )
 from .dtensor_metadata import (
+    DeviceMeshSpec,
     DTensorShardingMetadata,
     get_device_mesh_spec,
     ReplicateSpec,
@@ -143,18 +145,23 @@ def _validate_offset_read_archive(stream: io.RawIOBase) -> None:
         ) from error
 
 
-def _replicated_tensor_metadata(tensor: torch.Tensor) -> DTensorShardingMetadata:
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    mesh_spec = get_device_mesh_spec(
-        device_type=tensor.device.type,
+@functools.lru_cache(maxsize=None)
+def _world_mesh_spec(device_type: str, world_size: int) -> DeviceMeshSpec:
+    """A 1-D mesh of every rank, built once per device type and world size."""
+    return get_device_mesh_spec(
+        device_type=device_type,
         mesh_shape=(world_size,),
         mesh_data=tuple(range(world_size)),
     )
+
+
+def _replicated_tensor_metadata(tensor: torch.Tensor) -> DTensorShardingMetadata:
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
     return DTensorShardingMetadata(
         global_shape=tuple(tensor.shape),
         dtype=str(tensor.dtype),
         stride=tuple(tensor.stride()),
-        mesh_spec=mesh_spec,
+        mesh_spec=_world_mesh_spec(tensor.device.type, world_size),
         placements=(ReplicateSpec(),),
     )
 
@@ -202,7 +209,6 @@ def compute_local_shard_info(
     Returns:
         Tuple of (local_shape, global_offset) as tuples of ints.
     """
-    mesh_tensor = metadata.mesh_spec.mesh
     coordinate = metadata.mesh_spec.get_coordinate(rank)
     if coordinate is None:
         raise ValueError(
@@ -213,7 +219,7 @@ def compute_local_shard_info(
 
     local_shape, global_offset = _compute_local_shape_and_global_offset(
         torch.Size(metadata.global_shape),
-        mesh_tensor.shape,
+        metadata.mesh_spec.mesh_shape,
         list(coordinate),
         placements,
     )

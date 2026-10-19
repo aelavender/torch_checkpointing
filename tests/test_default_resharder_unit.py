@@ -26,6 +26,8 @@ from torch_checkpointing.default_resharder import (
     _default_file_read_workers,
     _slice_source_tensor,
     _validate_source_slice_bounds,
+    _world_mesh_spec,
+    compute_local_shard_info,
     DefaultResharder,
     ReshardingReadStrategy,
 )
@@ -36,6 +38,7 @@ from torch_checkpointing.distributed_metadata import (
 from torch_checkpointing.dtensor_metadata import (
     DeviceMeshSpec,
     DTensorShardingMetadata,
+    get_device_mesh_spec,
     ReplicateSpec,
     ShardSpec,
 )
@@ -258,6 +261,115 @@ def test_extract_sharding_metadata_treats_plain_tensors_as_replicated(
 
     assert "Found 2 plain tensors" in caplog.text
     assert "treating them as replicated tensors" in caplog.text
+
+
+def test_extract_sharding_metadata_builds_the_replicated_mesh_once() -> None:
+    _world_mesh_spec.cache_clear()
+    checkpoint_item = {f"tensor_{i}": torch.zeros(2) for i in range(3)}
+
+    with (
+        patch(
+            "torch_checkpointing.default_resharder.dist.is_initialized",
+            return_value=True,
+        ),
+        patch(
+            "torch_checkpointing.default_resharder.dist.get_world_size",
+            return_value=4,
+        ),
+        patch(
+            "torch_checkpointing.default_resharder.get_device_mesh_spec",
+            wraps=get_device_mesh_spec,
+        ) as build_mesh_spec,
+    ):
+        metadata = DefaultResharder().extract_sharding_metadata(
+            "model", checkpoint_item
+        )
+
+    assert build_mesh_spec.call_count == 1
+    mesh_specs = []
+    for tensor_metadata in metadata.values():
+        assert isinstance(tensor_metadata, DTensorShardingMetadata)
+        mesh_specs.append(tensor_metadata.mesh_spec)
+    assert all(spec is mesh_specs[0] for spec in mesh_specs)
+    assert mesh_specs[0].mesh_data == (0, 1, 2, 3)
+
+
+@pytest.fixture
+def mesh_tensor_forbidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail if a mesh tensor is rebuilt, which costs O(mesh size) per call."""
+
+    def rebuild(self: DeviceMeshSpec) -> torch.Tensor:
+        raise AssertionError("mesh tensor rebuilt")
+
+    monkeypatch.setattr(DeviceMeshSpec, "mesh", property(rebuild))
+
+
+@pytest.mark.parametrize(
+    ("rank", "global_offset"),
+    [(0, (0, 0)), (2, (0, 4)), (1, (4, 0)), (3, (4, 4))],
+)
+def test_compute_local_shard_info_resolves_rank_without_mesh_tensor(
+    mesh_tensor_forbidden: None, rank: int, global_offset: tuple[int, ...]
+) -> None:
+    metadata = DTensorShardingMetadata(
+        global_shape=(8, 8),
+        dtype="torch.float32",
+        stride=(8, 1),
+        mesh_spec=DeviceMeshSpec(
+            device_type="cpu", mesh_shape=(2, 2), mesh_data=(0, 2, 1, 3)
+        ),
+        placements=(ShardSpec(0), ShardSpec(1)),
+    )
+
+    assert compute_local_shard_info(metadata, rank) == ((4, 4), global_offset)
+
+
+def test_generate_load_plans_resolves_source_ranks_without_mesh_tensor(
+    mesh_tensor_forbidden: None,
+) -> None:
+    mesh_spec = DeviceMeshSpec(
+        device_type="cpu", mesh_shape=(4,), mesh_data=(0, 1, 2, 3)
+    )
+
+    def metadata(placement: ShardSpec | ReplicateSpec) -> DTensorShardingMetadata:
+        return DTensorShardingMetadata(
+            global_shape=(8, 8),
+            dtype="torch.float32",
+            stride=(8, 1),
+            mesh_spec=mesh_spec,
+            placements=(placement,),
+        )
+
+    source = DistributedItemMetadata(
+        nested_path_to_metadata={
+            ("weight",): [
+                GlobalObjectMetadata(
+                    sharding_metadata=metadata(ShardSpec(0)), ranks=(0, 1, 2, 3)
+                )
+            ]
+        },
+        rank_to_layout_info=dict.fromkeys(range(4)),
+    )
+
+    info = DefaultResharder()._generate_load_plans(
+        {("weight",): metadata(ReplicateSpec())}, source
+    )
+
+    assert info.non_reshardable_paths == []
+    plans = sorted(
+        info.nested_path_to_load_plans[("weight",)], key=lambda p: p.src_rank
+    )
+    assert plans == [
+        LoadPlan(
+            offsets=(2 * rank, 0),
+            sizes=(2, 8),
+            src_rank=rank,
+            src_fqn="weight",
+            src_offsets=(0, 0),
+            src_sizes=(2, 8),
+        )
+        for rank in range(4)
+    ]
 
 
 @pytest.mark.parametrize(

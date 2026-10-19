@@ -4,8 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Iterator
+
 import pytest
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard
+from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch_checkpointing.checkpoint_base import CheckpointInfo
 from torch_checkpointing.checkpoint_layout import (
     LayoutInfo,
@@ -276,7 +282,7 @@ def test_distributed_metadata_with_layout_info():
     # Create simple tensor sharding metadata
     mesh_spec = DeviceMeshSpec.from_mesh(
         device_type="cpu",
-        mesh=torch.tensor([0, 1]),
+        mesh=torch.tensor([[0, 1]]),
         mesh_dim_names=("dp", "tp"),
     )
     tensor_metadata = DTensorShardingMetadata(
@@ -697,3 +703,119 @@ def test_v1_to_v2_conversion():
     assert len(weight_groups) == 1
     assert weight_groups[0].ranks == (0, 1)
     assert weight_groups[0].sharding_metadata.global_shape == (8, 16)
+
+
+def _coordinate_by_mesh_search(
+    spec: DeviceMeshSpec, rank: int
+) -> tuple[int, ...] | None:
+    indices = torch.where(spec.mesh == rank)
+    if indices[0].numel() == 0:
+        return None
+    return tuple(int(index[0]) for index in indices)
+
+
+@pytest.mark.parametrize(
+    ("mesh_shape", "mesh_data"),
+    [
+        ((4,), (0, 1, 2, 3)),
+        ((2, 2), (0, 2, 1, 3)),
+        ((2, 3), (6, 7, 8, 9, 10, 11)),
+        ((2, 2, 2), (7, 6, 5, 4, 3, 2, 1, 0)),
+    ],
+)
+def test_get_coordinate_matches_a_search_of_the_mesh(
+    mesh_shape: tuple[int, ...], mesh_data: tuple[int, ...]
+) -> None:
+    spec = DeviceMeshSpec(device_type="cpu", mesh_shape=mesh_shape, mesh_data=mesh_data)
+    for rank in (*mesh_data, max(mesh_data) + 1):
+        assert spec.get_coordinate(rank) == _coordinate_by_mesh_search(spec, rank)
+
+
+@pytest.mark.parametrize(
+    ("mesh_shape", "mesh_data", "mesh_dim_names", "match"),
+    [
+        ((2, 2), (0, 1, 2), None, "needs 4"),
+        ((2, 2), (0, 1, 2, 3, 4), None, "needs 4"),
+        ((2, 2), (0, 1, 0, 2), None, "duplicate ranks"),
+        ((2, 2), (0, 1, 2, 3), ("dp",), "do not match"),
+    ],
+)
+def test_device_mesh_spec_rejects_invalid_meshes(
+    mesh_shape: tuple[int, ...],
+    mesh_data: tuple[int, ...],
+    mesh_dim_names: tuple[str, ...] | None,
+    match: str,
+) -> None:
+    fields = {
+        "device_type": "cpu",
+        "mesh_shape": mesh_shape,
+        "mesh_data": mesh_data,
+        "mesh_dim_names": mesh_dim_names,
+    }
+    with pytest.raises(ValueError, match=match):
+        DeviceMeshSpec(**fields)
+    with pytest.raises(ValueError, match=match):
+        DeviceMeshSpec.from_dict(fields)
+
+
+@pytest.fixture
+def fake_process_group() -> Iterator[None]:
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=4)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+def test_from_dtensor_builds_one_mesh_spec_per_device_mesh(
+    fake_process_group: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+    expected = DeviceMeshSpec.from_mesh(
+        device_type="cpu", mesh=mesh.mesh, mesh_dim_names=("dp", "tp")
+    )
+    from_mesh = DeviceMeshSpec.from_mesh
+    calls: list[str] = []
+
+    def counting_from_mesh(
+        device_type: str,
+        mesh: torch.Tensor,
+        mesh_dim_names: tuple[str, ...] | None = None,
+    ) -> DeviceMeshSpec:
+        calls.append("from_mesh")
+        return from_mesh(device_type, mesh, mesh_dim_names)
+
+    monkeypatch.setattr(DeviceMeshSpec, "from_mesh", staticmethod(counting_from_mesh))
+    specs = [
+        DTensorShardingMetadata.from_dtensor(
+            DTensor.from_local(
+                torch.zeros(2, 2), mesh, [Shard(0), Shard(1)], run_check=False
+            )
+        ).mesh_spec
+        for _ in range(3)
+    ]
+
+    assert len(calls) == 1
+    assert all(spec is specs[0] for spec in specs)
+    assert specs[0] == expected
+
+
+def test_from_dtensor_keeps_specs_of_different_meshes_apart(
+    fake_process_group: None,
+) -> None:
+    mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+    full = DTensorShardingMetadata.from_dtensor(
+        DTensor.from_local(
+            torch.zeros(2, 2), mesh, [Shard(0), Shard(1)], run_check=False
+        )
+    ).mesh_spec
+    sub = DTensorShardingMetadata.from_dtensor(
+        DTensor.from_local(torch.zeros(2), mesh["tp"], [Shard(0)], run_check=False)
+    ).mesh_spec
+
+    assert (full.mesh_shape, full.mesh_data) == ((2, 2), (0, 1, 2, 3))
+    assert (sub.mesh_shape, sub.mesh_data, sub.mesh_dim_names) == (
+        (2,),
+        (0, 1),
+        ("tp",),
+    )

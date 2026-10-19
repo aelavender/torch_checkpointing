@@ -20,12 +20,17 @@ The key components are:
 - DTensorShardingMetadata: Complete DTensor distribution information
 """
 
+import itertools
+import math
+import weakref
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from functools import cached_property, lru_cache
 from typing import Any
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import (
     _StridedShard as DTensorStridedShard,
@@ -183,6 +188,22 @@ class DeviceMeshSpec:
     mesh_data: tuple[int, ...]
     mesh_dim_names: tuple[str, ...] | None = None
 
+    def __post_init__(self) -> None:
+        if len(self.mesh_data) != math.prod(self.mesh_shape):
+            raise ValueError(
+                f"mesh_data has {len(self.mesh_data)} ranks but mesh_shape "
+                f"{self.mesh_shape} needs {math.prod(self.mesh_shape)}"
+            )
+        if len(set(self.mesh_data)) != len(self.mesh_data):
+            raise ValueError(f"mesh_data contains duplicate ranks: {self.mesh_data}")
+        if self.mesh_dim_names is not None and len(self.mesh_dim_names) != len(
+            self.mesh_shape
+        ):
+            raise ValueError(
+                f"mesh_dim_names {self.mesh_dim_names} do not match mesh_shape "
+                f"{self.mesh_shape}"
+            )
+
     @cached_property
     def _hash(self) -> int:
         return hash(
@@ -206,6 +227,23 @@ class DeviceMeshSpec:
             mesh_data=tuple(mesh.flatten().tolist()),
             mesh_dim_names=mesh_dim_names,
         )
+
+    @classmethod
+    def from_device_mesh(cls, device_mesh: DeviceMesh) -> "DeviceMeshSpec":
+        """Create DeviceMeshSpec from a DeviceMesh, building it once per mesh.
+
+        Building a spec reads every rank in the mesh, so DTensors that share a
+        DeviceMesh share one spec instead of each paying O(mesh size).
+        """
+        spec = _DEVICE_MESH_SPECS.get(device_mesh)
+        if spec is None:
+            spec = cls.from_mesh(
+                device_type=device_mesh.device_type,
+                mesh=device_mesh.mesh,
+                mesh_dim_names=device_mesh.mesh_dim_names,
+            )
+            _DEVICE_MESH_SPECS[device_mesh] = spec
+        return spec
 
     @property
     def mesh(self) -> torch.Tensor:
@@ -243,8 +281,9 @@ class DeviceMeshSpec:
         """
         Get the coordinate of a rank in this mesh.
 
-        Uses torch.where() on the reconstructed mesh tensor for vectorized lookup.
-        Works correctly for non-contiguous meshes like [0, 2, 1, 3].
+        Looks the rank up in a rank-to-coordinate map built once per spec, so
+        resolving every rank of a mesh costs O(mesh size) in total rather than
+        per rank. Works correctly for non-contiguous meshes like [0, 2, 1, 3].
 
         Args:
             rank: The rank to find the coordinate for.
@@ -257,10 +296,7 @@ class DeviceMeshSpec:
             For a mesh tensor([[0, 1], [2, 3]]) and rank=2,
             returns (1, 0) since rank 2 is at row 1, column 0.
         """
-        indices = torch.where(self.mesh == rank)
-        if indices[0].numel() == 0:
-            return None
-        return tuple(int(idx[0].item()) for idx in indices)
+        return _rank_coordinates(self).get(rank)
 
 
 @lru_cache(maxsize=None)
@@ -292,6 +328,24 @@ def get_device_mesh_spec(
         mesh_data=mesh_data,
         mesh_dim_names=mesh_dim_names,
     )
+
+
+# Kept outside the specs so they are never pickled along with them, and keyed
+# weakly so a mesh or spec that is no longer used can be freed.
+_DEVICE_MESH_SPECS: "weakref.WeakKeyDictionary[DeviceMesh, DeviceMeshSpec]" = (
+    weakref.WeakKeyDictionary()
+)
+_MESH_COORDINATES: "weakref.WeakKeyDictionary[DeviceMeshSpec, dict[int, tuple[int, ...]]]" = weakref.WeakKeyDictionary()
+
+
+def _rank_coordinates(spec: DeviceMeshSpec) -> Mapping[int, tuple[int, ...]]:
+    """Map each rank in ``spec`` to its coordinate, computed once per spec."""
+    coordinates = _MESH_COORDINATES.get(spec)
+    if coordinates is None:
+        positions = itertools.product(*(range(size) for size in spec.mesh_shape))
+        coordinates = dict(zip(spec.mesh_data, positions, strict=True))
+        _MESH_COORDINATES[spec] = coordinates
+    return coordinates
 
 
 @dataclass(frozen=True)
@@ -361,13 +415,7 @@ class DTensorShardingMetadata(ShardingMetadata):
                 "Replicate placements."
             )
 
-        # Create DeviceMeshSpec from the DTensor's device mesh using factory method
-        # No need to clone - from_mesh converts tensor to tuples once at construction
-        mesh_spec = DeviceMeshSpec.from_mesh(
-            device_type=dtensor.device_mesh.device_type,
-            mesh=dtensor.device_mesh.mesh,
-            mesh_dim_names=dtensor.device_mesh.mesh_dim_names,
-        )
+        mesh_spec = DeviceMeshSpec.from_device_mesh(dtensor.device_mesh)
 
         return DTensorShardingMetadata(
             global_shape=tuple(dtensor.shape),
