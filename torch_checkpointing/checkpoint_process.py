@@ -82,11 +82,29 @@ class WorkerResponse:
     success: bool
     error_msg: str | None = None
     payload: dict[str, Any] | None = None
+    serialized_exception_type: bytes | None = None
+
+
+def _restore_worker_exception(response: WorkerResponse) -> Exception:
+    """Reconstruct the worker exception, retaining its traceback if that fails."""
+    error_msg = f"Unexpected response from worker process: {response.error_msg}"
+    logger.error(error_msg)
+    if response.serialized_exception_type is not None:
+        try:
+            exception_type = pickle.loads(response.serialized_exception_type)
+            return exception_type(error_msg)
+        except Exception:
+            pass
+    return RuntimeError(error_msg)
 
 
 class CheckpointProcess:
     """
     A checkpoint writer that writes checkpoints to a remote process.
+
+    Initialization and write failures preserve their exception type and remote
+    traceback when the type can be transported and reconstructed from a message.
+    Otherwise, the parent raises RuntimeError with the remote traceback.
     """
 
     def __init__(
@@ -280,12 +298,21 @@ class CheckpointProcess:
             error_text = traceback.format_exc()
             logger.error(f"Exception in subprocess  ({type(e).__name__}): {error_text}")
 
+            # Keep the type, not the exception's potentially unpicklable state.
+            # Separate bytes keep error_text available even
+            # when the parent cannot import the exception class.
+            try:
+                serialized_exception_type = pickle.dumps(type(e))
+            except Exception:
+                serialized_exception_type = None
+
             # Communicating exception via the queue to the main process
             parent_pipe.send(
                 WorkerResponse(
                     request_type=request_type,
                     success=False,
                     error_msg=error_text,
+                    serialized_exception_type=serialized_exception_type,
                 )
             )
             parent_pipe.close()
@@ -397,17 +424,14 @@ class CheckpointProcess:
                 "Parent end of pipe should be initialized"
             )
             response = self._parent_end.recv()
-            if response.success is False:
-                error_msg = (
-                    f"Unexpected response from worker process: {response.error_msg}"
-                )
-                logger.error(error_msg)
-                raise RuntimeError(error_msg)
-            return response.payload
         except (EOFError, BrokenPipeError, ConnectionResetError) as e:
             error_msg = f"Child process terminated unexpectedly: {e}"
             logger.error(error_msg)
             raise RuntimeError(error_msg) from e
+
+        if response.success is False:
+            raise _restore_worker_exception(response)
+        return response.payload
 
     def write(
         self,
