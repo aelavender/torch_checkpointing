@@ -34,6 +34,7 @@ from torch_checkpointing.checkpoint_layout import (
     TorchSerialization,
 )
 from torch_checkpointing.checkpoint_writer import (
+    CallbackArgs,
     CheckpointWriter,
     CheckpointWriterArgs,
     CheckpointWriterConfig,
@@ -121,15 +122,15 @@ class MockCallback:
         self.pre_finalize_event_logger: EventLogger | None = None
         self.finalize_event_logger: EventLogger | None = None
 
-    def pre_finalize_callback(self, path: str, event_logger: EventLogger):
+    def pre_finalize_callback(self, args: CallbackArgs):
         self.pre_finalize_called = True
-        self.pre_finalize_path = path
-        self.pre_finalize_event_logger = event_logger
+        self.pre_finalize_path = args.path
+        self.pre_finalize_event_logger = args.event_logger
 
-    def finalize_callback(self, path: str, event_logger: EventLogger):
+    def finalize_callback(self, args: CallbackArgs):
         self.finalize_called = True
-        self.finalize_path = path
-        self.finalize_event_logger = event_logger
+        self.finalize_path = args.path
+        self.finalize_event_logger = args.event_logger
 
 
 class _ConcurrencyProbe:
@@ -447,10 +448,10 @@ class TestCheckpointWriter(TestCase):
         writer.write(str(final_path), self._raw_checkpoint_info())
         self.assertEqual(mock_pre_finalize_callback.call_count, 1)
         self.assertEqual(
-            mock_pre_finalize_callback.call_args.args[0], str(expected_tmp_path)
+            mock_pre_finalize_callback.call_args.args[0].path, str(expected_tmp_path)
         )
         self.assertEqual(mock_finalize_callback.call_count, 1)
-        self.assertEqual(mock_finalize_callback.call_args.args[0], str(final_path))
+        self.assertEqual(mock_finalize_callback.call_args.args[0].path, str(final_path))
         self.assertTrue(final_path.exists())
         self.assertFalse(expected_tmp_path.exists())
 
@@ -478,10 +479,10 @@ class TestCheckpointWriter(TestCase):
         writer.write(str(final_path), self._raw_checkpoint_info())
         self.assertEqual(mock_pre_finalize_callback.call_count, 1)
         self.assertEqual(
-            mock_pre_finalize_callback.call_args.args[0], str(expected_tmp_path)
+            mock_pre_finalize_callback.call_args.args[0].path, str(expected_tmp_path)
         )
         self.assertEqual(mock_finalize_callback.call_count, 1)
-        self.assertEqual(mock_finalize_callback.call_args.args[0], str(final_path))
+        self.assertEqual(mock_finalize_callback.call_args.args[0].path, str(final_path))
 
         # Not renamed -- temp dir still exists
         self.assertFalse(final_path.exists())
@@ -607,20 +608,32 @@ class TestCheckpointWriter(TestCase):
         self.assertIsNotNone(self.mock_callback.finalize_event_logger)
         self.assertIsInstance(self.mock_callback.finalize_event_logger, EventLogger)
 
-    def test_pre_finalize_callback_runs_before_atomic_rename(self):
+    def test_callback_context_and_order_around_atomic_rename(self):
         checkpoint_path = Path(self.temp_dir) / "checkpoint_with_callback"
         temporary_path = checkpoint_path.parent / f"tmp_{checkpoint_path.name}"
         events: list[str] = []
 
-        def pre_finalize_callback(path: str, _event_logger: EventLogger) -> None:
+        def pre_write_callback(args: CallbackArgs) -> None:
+            events.append("pre_write")
+            self.assertEqual(Path(args.path), checkpoint_path)
+            self.assertIs(args.storage, writer._storage)
+            self.assertIsInstance(args.event_logger, EventLogger)
+            self.assertFalse(temporary_path.exists())
+            self.assertFalse(checkpoint_path.exists())
+
+        def pre_finalize_callback(args: CallbackArgs) -> None:
+            self.assertIs(args.storage, writer._storage)
+            self.assertIsInstance(args.event_logger, EventLogger)
             events.append("pre_finalize")
-            self.assertEqual(Path(path), temporary_path)
+            self.assertEqual(Path(args.path), temporary_path)
             self.assertTrue(temporary_path.is_dir())
             self.assertFalse(checkpoint_path.exists())
 
-        def finalize_callback(path: str, _event_logger: EventLogger) -> None:
+        def finalize_callback(args: CallbackArgs) -> None:
+            self.assertIs(args.storage, writer._storage)
+            self.assertIsInstance(args.event_logger, EventLogger)
             events.append("finalize")
-            self.assertEqual(Path(path), checkpoint_path)
+            self.assertEqual(Path(args.path), checkpoint_path)
             self.assertTrue(checkpoint_path.is_dir())
 
         writer = CheckpointWriter(
@@ -632,6 +645,7 @@ class TestCheckpointWriter(TestCase):
                 ),
                 rank_info=self.rank_info,
                 storage_config=self.storage_config,
+                pre_write_callback=pre_write_callback,
                 pre_finalize_callback=pre_finalize_callback,
                 finalize_callback=finalize_callback,
             )
@@ -653,7 +667,7 @@ class TestCheckpointWriter(TestCase):
 
         self.assertEqual(
             events,
-            ["pre_finalize", "barrier", "finalize"],
+            ["pre_write", "pre_finalize", "barrier", "finalize"],
         )
         self.assertFalse(temporary_path.exists())
 

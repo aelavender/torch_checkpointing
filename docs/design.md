@@ -397,7 +397,10 @@ is safe only when the caller selects one rank to write it.
 Metadata is written by `role_rank == 0` only. When a barrier is configured, the
 writer stages files under a `tmp_` directory, waits for all ranks at the barrier,
 then renames to the final path for atomicity; `pre_finalize_callback` runs before
-the barrier and `finalize_callback` after. With no barrier configured, the writer
+the barrier and `finalize_callback` after. All write hooks accept a
+`CallbackArgs` object containing the phase path, writer storage, and event logger.
+`pre_write_callback` runs with the final destination before any files are written.
+With no barrier configured, the writer
 writes directly to the final path and skips synchronization.
 
 ## The read pipeline

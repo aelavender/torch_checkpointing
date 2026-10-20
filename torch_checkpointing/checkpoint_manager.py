@@ -44,13 +44,13 @@ from .checkpoint_base import CheckpointBase, CheckpointItem
 from .checkpoint_loader import CheckpointLoader
 from .checkpoint_reader import CheckpointReader
 from .checkpoint_saver import CheckpointSaver
+from .checkpoint_writer import CallbackArgs
 from .config import (
     AsyncCheckpointSaverConfig,
     CheckpointLoaderConfig,
     CheckpointSaverConfig,
     SyncCheckpointSaverConfig,
 )
-from .logging_utils import EventLogger
 from .metadata_manager import DefaultMetadataManager, MetadataManager
 from .metadata_serialization import DistributedMetadataFormat
 from .schema import _CheckpointSchema, ItemSpec
@@ -98,8 +98,8 @@ class CheckpointManager:
         storage_config: StorageConfig | None = None
         subprocess_init_fn: Callable[..., None] | None = None
         subprocess_init_args: tuple[Any, ...] = ()
-        pre_finalize_callback: Callable[[str, EventLogger], None] | None = None
-        finalize_callback: Callable[[str, EventLogger], None] | None = None
+        pre_finalize_callback: Callable[[CallbackArgs], None] | None = None
+        finalize_callback: Callable[[CallbackArgs], None] | None = None
 
         def build(self) -> "CheckpointManager":
             return CheckpointManager(config=self)

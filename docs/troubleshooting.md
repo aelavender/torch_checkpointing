@@ -59,7 +59,7 @@ staging = CheckpointStagerConfig(
 
 ## `cannot pickle ...` when saving asynchronously
 
-**Cause.** An async manager runs the writer in a separate subprocess, so anything handed to that subprocess must be picklable. Lambdas and closures are not. This bites most often with the lower-level write callbacks (`pre_finalize_callback`, `finalize_callback`, `subprocess_init_fn`) and with values in your payload that capture unpicklable state.
+**Cause.** An async manager runs the writer in a separate subprocess, so anything handed to that subprocess must be picklable. Lambdas and closures are not. This bites most often with the lower-level write callbacks (`pre_write_callback`, `pre_finalize_callback`, `finalize_callback`, `subprocess_init_fn`) and with values in your payload that capture unpicklable state.
 
 **Fix.** Use module-level functions or `functools.partial` instead of lambdas/closures for any callable that reaches the subprocess (for example the callbacks accepted by `make_async_checkpoint_saver`), and keep every payload value picklable. This requirement also applies to values with `requires_copy=False`; bypassing the staging copy does not bypass subprocess serialization. A sync manager (`CheckpointManager.Config.with_sync_save()`) uses no subprocess, so it sidesteps the pickling requirement entirely.
 

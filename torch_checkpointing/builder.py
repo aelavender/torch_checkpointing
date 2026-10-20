@@ -19,6 +19,7 @@ import torch.distributed as dist
 from .checkpoint_process import CheckpointProcess
 from .checkpoint_saver import AsyncCheckpointSaver, SyncCheckpointSaver
 from .checkpoint_writer import (
+    CallbackArgs,
     CheckpointWriter,
     CheckpointWriterArgs,
 )
@@ -27,7 +28,6 @@ from .config import (
     DEFAULT_WAIT_TIMEOUT_SECS,
     SyncCheckpointSaverConfig,
 )
-from .logging_utils import EventLogger
 from .metadata_manager import MetadataManager
 from .staging import DefaultStager
 from .storage.base_storage import StorageConfig
@@ -70,8 +70,8 @@ def _default_subprocess_init(*args: Any) -> None:
 def make_sync_checkpoint_saver(
     config: SyncCheckpointSaverConfig | None = None,
     rank_info: RankInfo | None = None,
-    pre_finalize_callback: Callable[[str, EventLogger], None] | None = None,
-    finalize_callback: Callable[[str, EventLogger], None] | None = None,
+    pre_finalize_callback: Callable[[CallbackArgs], None] | None = None,
+    finalize_callback: Callable[[CallbackArgs], None] | None = None,
     storage_config: StorageConfig | None = None,
     checkpoint_metadata_manager: MetadataManager | None = None,
 ) -> SyncCheckpointSaver:
@@ -112,8 +112,8 @@ def make_sync_checkpoint_saver(
 
         # Custom callbacks
         saver = make_sync_checkpoint_saver(
-            pre_finalize_callback=lambda path, event_logger: validate_files(path),
-            finalize_callback=lambda path, event_logger: logger.info(f"Checkpoint done: {path}"),
+            pre_finalize_callback=lambda args: validate_files(args.path),
+            finalize_callback=lambda args: logger.info(f"Checkpoint done: {args.path}"),
         )
 
         # Disable barrier
@@ -150,8 +150,8 @@ def make_sync_checkpoint_saver(
 def make_async_checkpoint_saver(
     config: AsyncCheckpointSaverConfig | None = None,
     rank_info: RankInfo | None = None,
-    pre_finalize_callback: Callable[[str, EventLogger], None] | None = None,
-    finalize_callback: Callable[[str, EventLogger], None] | None = None,
+    pre_finalize_callback: Callable[[CallbackArgs], None] | None = None,
+    finalize_callback: Callable[[CallbackArgs], None] | None = None,
     subprocess_init_fn: Callable[..., None] | None = None,
     subprocess_init_args: tuple[Any, ...] = (),
     storage_config: StorageConfig | None = None,
@@ -192,10 +192,16 @@ def make_async_checkpoint_saver(
         # Create with default config
         saver = make_async_checkpoint_saver()
 
-        # Create with custom callbacks
+        # Async callbacks must be picklable module-level functions.
+        def validate_checkpoint(args):
+            validate_files(args.path)
+
+        def report_checkpoint(args):
+            logger.info(f"Checkpoint done: {args.path}")
+
         saver = make_async_checkpoint_saver(
-            pre_finalize_callback=lambda path, event_logger: validate_files(path),
-            finalize_callback=lambda path, event_logger: logger.info(f"Checkpoint done: {path}"),
+            pre_finalize_callback=validate_checkpoint,
+            finalize_callback=report_checkpoint,
         )
 
         # Create with custom subprocess init

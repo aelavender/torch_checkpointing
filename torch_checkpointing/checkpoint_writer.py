@@ -34,7 +34,7 @@ from .checkpoint_layout import (
 )
 from .logging_utils import EventLogger, EventType, get_log_event_type_for_file_save
 from .metadata_serialization import METADATA_FILE_NAME
-from .storage.base_storage import StorageConfig
+from .storage.base_storage import Storage, StorageConfig
 from .types import RankInfo
 
 DEFAULT_TEMP_DIR_PREFIX = "tmp_"
@@ -89,6 +89,20 @@ class CheckpointWriterConfig:
             )
 
 
+@dataclass(frozen=True)
+class CallbackArgs:
+    """Context passed to each checkpoint write callback.
+
+    ``path`` is the final destination for pre-write and finalize callbacks,
+    and the directory containing the written files for pre-finalize callbacks.
+    ``storage`` and ``event_logger`` belong to the writer executing the callback.
+    """
+
+    path: str
+    storage: Storage
+    event_logger: EventLogger
+
+
 @dataclass
 class CheckpointWriterArgs:
     """All input arguments to checkpoint writer.
@@ -102,14 +116,18 @@ class CheckpointWriterArgs:
                 Called after barrier synchronization (all ranks coordinated).
         storage_config: StorageConfig backend to use for I/O operations. If None, defaults to LocalFileSystemStorageConfig
                 with directio enabled.
+        pre_write_callback: Pickleable validation hook called on every writing rank
+                before any files are written; raising aborts the write.
+                All write hooks receive a CallbackArgs instance.
     """
 
     config: CheckpointWriterConfig
     rank_info: RankInfo
     storage_config: StorageConfig
-    pre_finalize_callback: Callable[[str, EventLogger], None] | None = None
-    finalize_callback: Callable[[str, EventLogger], None] | None = None
+    pre_finalize_callback: Callable[[CallbackArgs], None] | None = None
+    finalize_callback: Callable[[CallbackArgs], None] | None = None
     metric_prefix: str = "train.checkpoint_write"
+    pre_write_callback: Callable[[CallbackArgs], None] | None = None
 
     def build(self) -> "CheckpointWriter":
         """Create the checkpoint writer for this args configuration.
@@ -191,6 +209,13 @@ class CheckpointWriter:
             f"Writing checkpoint to {path} for rank {self._args.rank_info.global_rank}"
         )
 
+        if self._args.pre_write_callback is not None:
+            self._args.pre_write_callback(
+                CallbackArgs(
+                    path=str(path), storage=self._storage, event_logger=event_logger
+                )
+            )
+
         final_path = Path(path)
         if self._args.config.write_to_temp_dir:
             tmp_dir_path = _temp_dir_path(final_path, self._args.config.temp_dir_prefix)
@@ -246,7 +271,13 @@ class CheckpointWriter:
         if self._args.pre_finalize_callback is not None:
             logger.debug(f"Executing pre-finalize callback for {tmp_dir_path}")
             pre_finalize_event_logger = EventLogger()
-            self._args.pre_finalize_callback(str(tmp_dir_path), event_logger)
+            self._args.pre_finalize_callback(
+                CallbackArgs(
+                    path=str(tmp_dir_path),
+                    storage=self._storage,
+                    event_logger=event_logger,
+                ),
+            )
             logger.info(
                 "Pre-finalize callback duration",
                 extra=pre_finalize_event_logger(
@@ -295,7 +326,13 @@ class CheckpointWriter:
         # Execute finalize callback if available
         if self._args.finalize_callback is not None:
             logger.debug(f"Executing finalize callback for {path}")
-            self._args.finalize_callback(str(final_path), event_logger)
+            self._args.finalize_callback(
+                CallbackArgs(
+                    path=str(final_path),
+                    storage=self._storage,
+                    event_logger=event_logger,
+                ),
+            )
 
         logger.info(
             f"Successfully wrote checkpoint to {final_path} for rank {self._args.rank_info.global_rank}"

@@ -14,6 +14,7 @@ import pytest
 import torch
 from torch_checkpointing.checkpoint_base import CheckpointBase, CheckpointItem
 from torch_checkpointing.checkpoint_manager import CheckpointManager
+from torch_checkpointing.checkpoint_writer import CallbackArgs
 from torch_checkpointing.config import (
     AsyncCheckpointSaverConfig,
     CheckpointLoaderConfig,
@@ -160,8 +161,8 @@ def test_sync_save_runs_finalize_callback_after_checkpoint_write(
     checkpoint_path = os.path.join(tmp_path, "sync_checkpoint")
     finalize_observed_checkpoint: list[bool] = []
 
-    def finalize_callback(checkpoint_id: str, _event_logger: Any) -> None:
-        assert checkpoint_id == checkpoint_path
+    def finalize_callback(args: CallbackArgs) -> None:
+        assert args.path == checkpoint_path
         finalize_observed_checkpoint.append(
             os.path.exists(os.path.join(checkpoint_path, "model_0.pt"))
         )
@@ -203,8 +204,8 @@ def test_async_save_config_forwards_finalize_callback_to_builder() -> None:
     config = _async_config_without_accelerator()
     fake_saver = FakeSaver(stager)
 
-    def finalize_callback(checkpoint_id: str, _event_logger: Any) -> None:
-        assert checkpoint_id == "checkpoint"
+    def finalize_callback(args: CallbackArgs) -> None:
+        assert args.path == "checkpoint"
 
     config.finalize_callback = finalize_callback
     with mock.patch(

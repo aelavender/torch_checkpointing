@@ -212,21 +212,22 @@ commit too.
 
 By default, inside `CheckpointWriter.write()` the ordering is:
 
-1. Write all shard files (and, on `role_rank == 0`, the metadata file) into a
+1. Run `pre_write_callback` with the final destination; raising aborts the write.
+2. Write all shard files (and, on `role_rank == 0`, the metadata file) into a
    temporary directory.
-2. Run `pre_finalize_callback` (see below).
-3. If a barrier is configured, `execute_barrier(...)` — wait for every rank to
+3. Run `pre_finalize_callback` (see below).
+4. If a barrier is configured, `execute_barrier(...)` — wait for every rank to
    finish writing.
-4. On `role_rank == 0`, atomically rename the temporary directory to the final
+5. On `role_rank == 0`, atomically rename the temporary directory to the final
    path.
-5. Run `finalize_callback`.
+6. Run `finalize_callback`.
 
 The temporary-directory-then-rename dance is what makes a checkpoint atomic:
 readers never observe a half-written directory.
 
 ### Disabling the temporary directory
 
-`write_to_temp_dir` decides whether steps 1 and 4 above happen. It defaults to
+`write_to_temp_dir` decides whether files are staged in a temporary directory and renamed in step 5. It defaults to
 `True`; set it to `False` and every rank writes directly to the final path. The
 barrier and callbacks still run as above.
 
@@ -293,46 +294,46 @@ config = SyncCheckpointSaverConfig(
 
 ---
 
-## 3. Finalize callbacks
+## 3. Write callbacks
 
-The two finalize hooks let you run custom logic around the atomic-rename step.
-They are passed to the saver **factory functions**, not stored on the
-`CheckpointSaverConfig` objects, and flow through to `CheckpointWriterArgs`:
+All three hooks accept `Callable[[CallbackArgs], None]`. `CallbackArgs` is defined
+in `torch_checkpointing.checkpoint_writer` and contains `path`, the writer's
+`storage`, and its `event_logger`.
 
-```python
-@dataclass
-class CheckpointWriterArgs:
-    config: CheckpointWriterConfig
-    rank_info: RankInfo
-    storage_config: StorageConfig
-    pre_finalize_callback: Callable[[str, EventLogger], None] | None = None
-    finalize_callback: Callable[[str, EventLogger], None] | None = None
-    metric_prefix: str = "train.checkpoint_write"
-```
+- **`pre_write_callback`** runs on every writing rank before writing any files.
+  It receives the final destination path; raising aborts that rank's write.
+  Configure this hook on `CheckpointWriterArgs`.
+- **`pre_finalize_callback`** runs on every writing rank after all files are
+  written but before the barrier. Its path is the temporary directory when
+  `write_to_temp_dir=True`, otherwise the final directory.
+- **`finalize_callback`** runs on every writing rank after its barrier and
+  rename step, with the final path. Only rank 0 performs the rename.
 
-Both callbacks have the signature `(path: str, event_logger: EventLogger) -> None`:
-
-- **`pre_finalize_callback`** runs after all files are written but *before* the
-  barrier — it observes the temporary directory, on every rank. It is invoked
-  with the original `path` argument passed to `write()`.
-- **`finalize_callback`** runs *after* the barrier and rename — it is invoked
-  with the final path.
-
-Pass them to either factory:
+The two finalize hooks can also be passed to either saver factory:
 
 ```python
 from torch_checkpointing.builder import make_async_checkpoint_saver
+from torch_checkpointing.checkpoint_writer import CallbackArgs
+
+
+def validate_checkpoint(args: CallbackArgs) -> None:
+    validate_files(args.path)
+
+
+def report_checkpoint(args: CallbackArgs) -> None:
+    logger.info(f"Checkpoint done: {args.path}")
+
 
 saver = make_async_checkpoint_saver(
-    pre_finalize_callback=lambda path, event_logger: validate_files(path),
-    finalize_callback=lambda path, event_logger: logger.info(f"Checkpoint done: {path}"),
+    pre_finalize_callback=validate_checkpoint,
+    finalize_callback=report_checkpoint,
 )
 ```
 
-The same parameters exist on `make_sync_checkpoint_saver`. For asynchronous
-saves the callbacks execute in the checkpoint subprocess, so they must be
-picklable — prefer module-level functions or `functools.partial` over lambdas
-and closures.
+For asynchronous saves the callbacks execute in the checkpoint subprocess, so
+use picklable module-level functions, callable objects, or `functools.partial`.
+The writer constructs `CallbackArgs` there; storage clients do not need to be
+captured in the callback or pickled from the trainer.
 
 ---
 
@@ -690,7 +691,7 @@ altogether (identical save/load configuration on retry).
 | Cross-rank coordination | `BarrierConfig`, `DefaultStoreBarrierConfig` (the default), `TCPStoreBarrierConfig` | `barriers.py` |
 | Disable coordination *and* the atomic commit | `CheckpointWriterConfig(barrier_config=None)` | `checkpoint_writer.py` |
 | Keep coordination, drop the temp dir | `CheckpointWriterConfig(write_to_temp_dir=False)` | `checkpoint_writer.py` |
-| Finalize hooks | `pre_finalize_callback`, `finalize_callback` | `builder.py`, `checkpoint_writer.py` |
+| Write hooks | `pre_write_callback`, `pre_finalize_callback`, `finalize_callback` | `builder.py`, `checkpoint_writer.py` |
 | Metadata pipeline | `MetadataManager`, `DefaultMetadataManager` | `metadata_manager.py` |
 | Metadata payload | `CheckpointMetadata`, `DistributedMetadata`, `DistributedItemMetadata` | `distributed_metadata.py` |
 | Resharding interface | `Resharder` | `resharding.py` |
