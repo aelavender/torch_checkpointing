@@ -908,5 +908,31 @@ class TestCheckpointWriter(TestCase):
             self.assertEqual(global_data, "some_global_config_value")
 
 
+def test_generic_pre_write_receives_active_storage_and_final_path_before_creation(
+    tmp_path,
+):
+    path = tmp_path / "checkpoint"
+    args = CheckpointWriterArgs(
+        config=CheckpointWriterConfig(),
+        rank_info=RankInfo(0, 1, 0, 1),
+        storage_config=LocalFileSystemStorageConfig(use_direct_io=False),
+    )
+    args.config.write_to_temp_dir = True
+    # A single-rank real default-store barrier requires no process group.
+    args.config.barrier_config = DefaultStoreBarrierConfig()
+    received = []
+    args.pre_write_callback = lambda callback_args: received.append(
+        (
+            callback_args.path,
+            callback_args.storage,
+            path.exists(),
+            (tmp_path / "tmp_checkpoint").exists(),
+        )
+    )
+    writer = CheckpointWriter(args)
+    writer.write(str(path), CheckpointWriteInfo(checkpoint_items={}))
+    assert received == [(str(path), writer._storage, False, False)]
+
+
 if __name__ == "__main__":
     run_tests()
